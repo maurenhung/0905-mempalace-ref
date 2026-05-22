@@ -43,8 +43,12 @@ def _normalize_wing(wing: str | None) -> str | None:
     (e.g. ``mempalace_public``).  Callers that pass the raw directory name
     (``mempalace-public``) would silently miss.  This helper aligns the lookup
     key with the stored metadata.
+
+    Non-string inputs (from corrupt or hand-edited ``tunnels.json``) return
+    ``None`` rather than raising, so a single malformed record cannot break
+    the read-path filters that iterate the whole file.
     """
-    if wing is None:
+    if not isinstance(wing, str):
         return None
     wing = wing.strip()
     if not wing:
@@ -432,7 +436,8 @@ def create_tunnel(
     Tunnels are undirected: ``create_tunnel(A, B)`` and ``create_tunnel(B, A)``
     resolve to the same canonical ID. A second call with the same endpoints
     updates the stored label (and drawer IDs, if provided) rather than
-    creating a duplicate.
+    creating a duplicate. Endpoints are compared **verbatim** — ``"my-wing"``
+    and ``"my_wing"`` are distinct (see Note below and #1504).
 
     The ``source`` / ``target`` fields on the returned dict preserve the
     argument order the caller used, so callers can display it directionally
@@ -457,14 +462,18 @@ def create_tunnel(
 
     Raises:
         ValueError: if any wing or room is empty or non-string.
+
+    Note:
+        Wing slugs are stored verbatim — passing ``"my-wing"`` and ``"my_wing"``
+        produces two distinct tunnels (canonical IDs differ). Read-path helpers
+        (``list_tunnels`` / ``follow_tunnels``) normalize both sides at compare
+        time so legacy underscore data and explicit-flag hyphen data both
+        match queries in either form. See #1504.
     """
     source_wing = _require_name(source_wing, "source_wing")
     source_room = _require_name(source_room, "source_room")
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
-
-    source_wing = _normalize_wing(source_wing)
-    target_wing = _normalize_wing(target_wing)
 
     tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
@@ -509,10 +518,17 @@ def list_tunnels(wing: str = None):
     norm_wing = _normalize_wing(wing)
     tunnels = _load_tunnels()
     if norm_wing:
+        # Normalize stored wings too: older tunnels.json records hold the
+        # underscore form (from the prior write-path normalization), while
+        # post-#1504 records hold whatever the caller passed. Comparing
+        # normalized-on-both-sides matches either.
+        # ``t.get(k) or {}`` (not ``t.get(k, {})``) handles ``"source": null``
+        # from a hand-edited file — ``.get`` defaults only on missing keys.
         tunnels = [
             t
             for t in tunnels
-            if t["source"]["wing"] == norm_wing or t["target"]["wing"] == norm_wing
+            if _normalize_wing((t.get("source") or {}).get("wing")) == norm_wing
+            or _normalize_wing((t.get("target") or {}).get("wing")) == norm_wing
         ]
     return tunnels
 
@@ -532,15 +548,23 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     Given a location (wing/room), finds all tunnels leading from or to it,
     and optionally fetches the connected drawer content.
     """
+    # Fall back to raw ``wing`` so an empty/whitespace query string still
+    # produces a value to compare with; ``_normalize_wing`` returns ``None``
+    # for empty input. Stored wings are normalized on the read path so the
+    # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
+    # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
     tunnels = _load_tunnels()
     connections = []
 
     for t in tunnels:
-        src = t["source"]
-        tgt = t["target"]
+        # ``or {}`` (not ``.get(k, {})``) handles ``"source": null`` from a
+        # hand-edited file — ``.get`` defaults only on missing keys, not on
+        # explicit ``null`` values.
+        src = t.get("source") or {}
+        tgt = t.get("target") or {}
 
-        if src["wing"] == norm_wing and src["room"] == room:
+        if _normalize_wing(src.get("wing")) == norm_wing and src.get("room") == room:
             connections.append(
                 {
                     "direction": "outgoing",
@@ -551,7 +575,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     "tunnel_id": t["id"],
                 }
             )
-        elif tgt["wing"] == norm_wing and tgt["room"] == room:
+        elif _normalize_wing(tgt.get("wing")) == norm_wing and tgt.get("room") == room:
             connections.append(
                 {
                     "direction": "incoming",
@@ -669,7 +693,12 @@ def compute_topic_tunnels(
                 continue
             bucket.setdefault(key, n.strip())
         if bucket:
-            wing_topics[wing.strip()] = bucket
+            # Auto-generated topic tunnels normalize the wing key so repeated
+            # mining runs with mixed slug forms (``my-wing`` vs ``my_wing``)
+            # produce one canonical record, not two parallel ones. User-issued
+            # ``create_tunnel`` calls (e.g. via MCP) preserve verbatim slugs;
+            # only this auto-generation path canonicalizes the key.
+            wing_topics[normalize_wing_name(wing.strip())] = bucket
 
     wings = sorted(wing_topics.keys())
     created: list[dict] = []
@@ -713,8 +742,19 @@ def topic_tunnels_for_wing(
     if not topics_by_wing or not isinstance(wing, str) or not wing.strip():
         return []
 
-    wing = wing.strip()
+    # Canonicalize the lookup key so a hyphenated arg still finds an
+    # underscore-normalized entry (and vice versa). ``compute_topic_tunnels``
+    # canonicalizes the keys it writes, so callers can pass either form.
+    wing = normalize_wing_name(wing.strip())
     own = topics_by_wing.get(wing)
+    if own is None:
+        # Fallback: caller may have built ``topics_by_wing`` with verbatim
+        # keys (unusual but allowed). Try every entry, normalized, before
+        # giving up.
+        for k, v in topics_by_wing.items():
+            if isinstance(k, str) and normalize_wing_name(k.strip()) == wing:
+                own = v
+                break
     if not isinstance(own, (list, tuple)) or not own:
         return []
 
@@ -724,7 +764,9 @@ def topic_tunnels_for_wing(
     # one place.
     created: list[dict] = []
     for other, other_topics in topics_by_wing.items():
-        if not isinstance(other, str) or not other.strip() or other == wing:
+        if not isinstance(other, str) or not other.strip():
+            continue
+        if normalize_wing_name(other.strip()) == wing:
             continue
         if not isinstance(other_topics, (list, tuple)) or not other_topics:
             continue
@@ -736,4 +778,79 @@ def topic_tunnels_for_wing(
                 label_prefix=label_prefix,
             )
         )
+    return created
+
+
+def entity_tunnels_for_wing(
+    wing: str,
+    hallways: list,
+    label_prefix: str = "shared entity",
+) -> list:
+    """Compute entity tunnels involving a single wing.
+
+    An entity tunnel bridges two wings when the same entity (person,
+    project, concept, interest) appears in within-wing hallways of both.
+    This is the architectural counterpart to ``topic_tunnels_for_wing`` —
+    same storage path (``create_tunnel`` → ``~/.mempalace/tunnels.json``),
+    same dedup, same listing API — but the substrate is hallway records
+    rather than raw topic words. See v4 architecture doc, Wing →
+    Drawer-entities → Hallway → Tunnel.
+
+    Endpoints use the synthetic room id ``entity:<name>`` (mirrors
+    ``topic:<slug>``) so they can't collide with literal folder-derived
+    rooms of the same name. Casing of the entity is preserved.
+
+    Topic tunnels are NOT replaced — both systems coexist for one release
+    cycle while entity tunnels prove out. Deprecation is a separate PR.
+    """
+    if not hallways or not isinstance(wing, str) or not wing.strip():
+        return []
+
+    wing_norm = normalize_wing_name(wing.strip())
+
+    # Build: entity -> {normalized_wing -> original_wing_display_name}
+    # Both entity_a and entity_b positions count toward "this entity is
+    # in this wing"; the hallway primitive treats the pair as unordered.
+    entity_wings: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        h_wing_norm = normalize_wing_name(h_wing.strip())
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not isinstance(ent, str) or not ent.strip():
+                continue
+            # setdefault preserves the first-seen display form so the
+            # tunnel endpoint matches the wing name the caller used.
+            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
+
+    if not entity_wings:
+        return []
+
+    created: list = []
+    # Stable entity order so tunnels materialize deterministically across
+    # runs — matters for tests and for diff-able tunnels.json files.
+    for entity in sorted(entity_wings.keys()):
+        wings_for_entity = entity_wings[entity]
+        if wing_norm not in wings_for_entity:
+            continue
+        own_wing_display = wings_for_entity[wing_norm]
+        # Stable other-wing order; ``wing_norm`` itself is excluded so an
+        # entity that lives only in this wing produces zero tunnels.
+        other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
+        for other_norm in other_wings_norm:
+            other_display = wings_for_entity[other_norm]
+            room = f"entity:{entity}"
+            tunnel = create_tunnel(
+                source_wing=own_wing_display,
+                source_room=room,
+                target_wing=other_display,
+                target_room=room,
+                label=f"{label_prefix}: {entity}",
+                kind="entity",
+            )
+            created.append(tunnel)
     return created
